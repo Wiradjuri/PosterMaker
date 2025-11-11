@@ -3,6 +3,10 @@
 __pycache__/
 *.py[cod]
 *.pyo
+.pipfile.lock
+.mypy_cache/
+.pytest_cache/
+pipenv/
 
 # Virtualenv
 .venv/
