@@ -1,0 +1,4 @@
+ # Requirements for the PosterMaker application
+pillow
+pyside6
+pytest

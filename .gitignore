@@ -1,0 +1,29 @@
+# --------------------------- .gitignore ---------------------------
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Builds
+build/
+dist/
+*.egg-info/
+
+# Logs and cache
+*.log
+logs/
+output/
+
+# OS
+.DS_Store
+Thumbs.db
+EOF
