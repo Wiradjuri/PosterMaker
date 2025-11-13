@@ -95,7 +95,9 @@ def _run_realesrgan(
     We explicitly pass the models directory (-m) and set cwd=exe.parent
     so the binary reliably finds its assets.
     """
-    models_dir = _detect_models_dir(exe)
+    # Do not explicitly pass a models directory; let the executable use its
+    # default ./models folder next to the exe. Force GPU 0 via -g 0 so the
+    # NCNN binary doesn't auto-pick an iGPU.
     cmd = [
         str(exe),
         "-i", str(inp),
@@ -104,7 +106,7 @@ def _run_realesrgan(
         "-s", str(scale),
         "-t", str(tilesize),
         "-f", "png",
-        "-m", str(models_dir),
+        "-g", "0",
     ]
     if fp16:
         cmd.append("-x")  # enable FP16
@@ -196,6 +198,14 @@ def _ai_upscale_exact(
                 cur_w, cur_h = im.size
             need_scale = max(target_w / cur_w, target_h / cur_h)
             log.info(f"Now at {cur_w}x{cur_h}; remaining scale ≈ {need_scale:.2f}")
+
+        # Before doing a final Pillow resize, allow a short-circuit so callers
+        # can inspect the raw NCNN/Real-ESRGAN output. Copy the latest NCNN
+        # PNG directly to the destination and return early.
+        import shutil
+        shutil.copy(cur_path, dst_img)
+        log.info(f"DEBUG: Saved raw NCNN output: {dst_img}")
+        return
 
         banner("FINAL RESAMPLE TO EXACT SIZE")
         log.info(f"Final output will be {target_w}×{target_h} px")
