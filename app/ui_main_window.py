@@ -1,25 +1,28 @@
 # app/ui_main_window.py
-# FIXED VERSION - Dark-mode GUI for PosterMaker with all critical bugs addressed:
-# - Fixed progress bar jumping backwards with smooth animation
-# - Added image thumbnail preview
-# - Fixed checkbox visibility and styling
-# - Proper QThread worker to prevent UI freezing
-# - Better exception handling with modal popups
-# - Auto-open output folder on success
-# - Fixed ChatGPT-inspired dark theme
-# - Disabled Process button during processing
+# FULLY REWRITTEN - Modern dark-themed GUI for PosterMaker
+# CRITICAL FIXES IMPLEMENTED:
+# - QThread worker prevents UI freezing
+# - Monotonic smooth progress bar (never goes backwards)
+# - Image thumbnail preview
+# - Proper button lockout during processing
+# - Modal error dialogs with traceback
+# - Auto-open output folder
+# - Fixed checkbox visibility
+# - Valid QSS only (no invalid CSS)
+# - MAIN CONTENT WRAPPED IN QScrollArea (scrolls when window is small)
 
 from __future__ import annotations
 
 import json
 import logging
 import os
-import sys
 import subprocess
+import sys
+import traceback
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer, QPropertyAnimation, QEasingCurve
-from PySide6.QtGui import QTextCursor, QPixmap, QFont
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer
+from PySide6.QtGui import QTextCursor, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -38,9 +41,9 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QVBoxLayout,
     QWidget,
-    QScrollArea,
-    QSizePolicy,
+    QScrollArea,  # <-- added
 )
+from tomlkit import key
 
 from app.imaging.pipeline import process_exact, A_SIZES_MM
 
@@ -48,14 +51,15 @@ APP_NAME = "PosterMaker"
 CONFIG_PATH = Path.home() / ".poster_maker_config.json"
 
 
-# --------------------------- Logging bridge ---------------------------
-
+# --------------------------- Logging Bridge ---------------------------
 class QtLogEmitter(QObject):
+    """Signal emitter for logging to Qt UI"""
+
     message = Signal(str)
 
 
 class QtLogHandler(logging.Handler):
-    """Routes logging records to a Qt signal so we can append to the UI."""
+    """Routes Python logging to Qt signal for UI display"""
 
     def __init__(self, emitter: QtLogEmitter):
         super().__init__()
@@ -65,814 +69,871 @@ class QtLogHandler(logging.Handler):
         try:
             msg = self.format(record)
         except Exception:
-            msg = record.getMessage()
+            msg = str(record.getMessage())
         self.emitter.message.emit(msg)
 
 
-# --------------------------- Worker Thread (FIXED) ---------------------------
-
+# --------------------------- Worker Thread ---------------------------
 class ProcessWorker(QThread):
-    """FIXED: Properly isolated worker thread that never accesses GUI directly"""
+    """
+    Background worker for AI upscaling.
+    Never accesses GUI directly - all communication via signals.
+    """
+
     finished = Signal(bool, str, str)  # success, output_path, error_message
-    progress = Signal(int)
-    preview = Signal(str)  # preview path emitted from pipeline
-    status = Signal(str)   # status messages for UI
+    progress = Signal(int)  # progress percentage (0-100)
+    preview = Signal(str)  # preview image path
+    status = Signal(str)  # status messages
 
     def __init__(self, args: dict, parent=None):
         super().__init__(parent)
         self.args = args
         self._should_stop = False
+        self._last_progress = 0  # Track to ensure monotonic
 
     def stop(self):
-        """Request worker to stop (graceful shutdown)"""
+        """Request graceful shutdown"""
         self._should_stop = True
 
     def run(self) -> None:
-        """FIXED: Complete error isolation - never throws exceptions to main thread"""
+        """
+        Completely isolated from GUI.
+        All communication via signals only.
+        """
         try:
-            self.status.emit("Initializing AI upscaling...")
-            
-            # CRITICAL: Wrap progress callback to check for stop requests
-            def progress_wrapper(value):
+            self.status.emit("Starting AI upscaling...")
+            self._emit_progress(0)
+
+            # Define callbacks for pipeline
+            def on_progress(pct: int):
                 if self._should_stop:
                     raise RuntimeError("Processing cancelled by user")
-                self.progress.emit(value)
-            
-            def preview_wrapper(path):
+                self._emit_progress(pct)
+
+            def on_preview(path: str):
                 if self._should_stop:
-                    return
+                    raise RuntimeError("Processing cancelled by user")
                 self.preview.emit(path)
-            
-            self.status.emit("Starting Real-ESRGAN processing...")
-            
-            # Call pipeline with isolated callbacks
-            out_path = process_exact(
-                **self.args,
-                progress_cb=progress_wrapper,
-                preview_cb=preview_wrapper,
+
+            # Execute pipeline
+            output_path = process_exact(
+                input_path=self.args["input_path"],
+                output_dir=self.args["output_dir"],
+                paper=self.args["paper"],
+                dpi=self.args["dpi"],
+                portrait=self.args["portrait"],
+                exe_path=self.args["exe_path"],
+                model=self.args["model"],
+                tilesize=self.args["tilesize"],
+                fp16=self.args["fp16"],
+                force_600dpi=self.args["force_600dpi"],
+                keep_native_if_larger=False,
+                progress_cb=on_progress,
+                preview_cb=on_preview,
             )
-            
-            if self._should_stop:
-                self.finished.emit(False, "", "Processing was cancelled")
-                return
-                
-            self.status.emit("Processing completed successfully")
-            self.finished.emit(True, str(out_path), "")
-            
+
+            # Ensure 100% progress on success
+            self._emit_progress(100)
+            self.status.emit("Processing complete!")
+
+            # Emit success
+            self.finished.emit(True, str(output_path), "")
+
         except Exception as e:
-            error_msg = f"Processing failed: {str(e)}"
-            self.status.emit(f"Error: {error_msg}")
+            # Capture full traceback
+            error_msg = f"{str(e)}\n\n{traceback.format_exc()}"
+            self.status.emit(f"Error: {str(e)}")
             self.finished.emit(False, "", error_msg)
+
+    def _emit_progress(self, pct: int):
+        """Ensure progress is monotonic (never decreasing)"""
+        pct = max(self._last_progress, pct)
+        self._last_progress = pct
+        self.progress.emit(pct)
 
 
 # --------------------------- Smooth Progress Bar ---------------------------
-
 class SmoothProgressBar(QProgressBar):
-    """FIXED: Progress bar that never jumps backwards and animates smoothly"""
-    
+    """
+    Progress bar that smoothly animates and never goes backwards.
+    """
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._target_value = 0
-        self._current_value = 0
-        
-        # Animation for smooth progress
-        self._animation = QPropertyAnimation(self, b"value")
-        self._animation.setDuration(200)  # 200ms animation
-        self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._animate_step)
+        self._timer.setInterval(20)  # ~50 FPS
+
     def setValueSmooth(self, value: int):
-        """CRITICAL: Set value with smooth animation, never going backwards"""
-        # Clamp to valid range
+        """
+        Set value with smooth animation, never allowing backwards movement.
+        """
         value = max(0, min(100, value))
-        
-        # CRITICAL: Never allow progress to go backwards
+
+        # Never go backwards
         if value <= self._target_value:
             return
-            
+
         self._target_value = value
-        
-        # Animate from current displayed value to target
-        self._animation.stop()
-        self._animation.setStartValue(self.value())
-        self._animation.setEndValue(value)
-        self._animation.start()
+
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def _animate_step(self):
+        """Animate one step towards target"""
+        current = self.value()
+        target = self._target_value
+
+        if current >= target:
+            self._timer.stop()
+            return
+
+        diff = target - current
+        step = max(1, diff // 10)
+        new_val = min(current + step, target)
+
+        self.setValue(new_val)
 
 
 # --------------------------- Image Preview Widget ---------------------------
-
 class ImagePreviewWidget(QLabel):
-    """FIXED: Shows thumbnail preview of input image"""
-    
+    """Thumbnail preview of input image"""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(200, 150)
-        self.setMaximumSize(300, 225)
-        self.setStyleSheet("""
+        self.setMinimumSize(220, 160)
+        self.setMaximumSize(380, 260)
+        self.setStyleSheet(
+            """
             QLabel {
                 border: 2px dashed #555;
                 border-radius: 8px;
                 background-color: #1a1a1a;
                 color: #888;
+                padding: 10px;
             }
-        """)
+        """
+        )
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setText("No image selected\\nPreviews will appear here")
+        self.setText("No image selected\n\nPreview will appear here")
         self.setScaledContents(False)
-        
+
     def setImagePath(self, path: str):
-        """Load and display thumbnail of image"""
+        """Load and display thumbnail"""
         try:
             if not path or not Path(path).exists():
                 self.clear()
                 return
-                
+
             pixmap = QPixmap(path)
             if pixmap.isNull():
-                self.setText("Could not load image")
+                self.setText("Failed to load image")
                 return
-                
-            # Scale to fit widget while maintaining aspect ratio
+
+            # Scale to fit while maintaining aspect ratio
             scaled = pixmap.scaled(
-                self.size(), 
-                Qt.AspectRatioMode.KeepAspectRatio, 
-                Qt.TransformationMode.SmoothTransformation
+                self.maximumWidth() - 20,
+                self.maximumHeight() - 20,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
             )
+
             self.setPixmap(scaled)
-            
+
         except Exception as e:
-            self.setText(f"Preview error:\\n{str(e)}")
-            
+            self.setText(f"Preview error:\n{str(e)}")
+
     def clear(self):
-        """Clear preview and show placeholder"""
+        """Clear preview"""
         super().clear()
-        self.setText("No image selected\\nPreviews will appear here")
+        self.setText("No image selected\n\nPreview will appear here")
 
 
-# --------------------------- Main Window (COMPLETELY FIXED) ---------------------------
-
+# --------------------------- Main Window ---------------------------
 class MainWindow(QMainWindow):
+    """Main application window with all critical bugs fixed"""
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} – AI Poster Upscaler")
-        self.resize(1400, 850)  # Larger for preview
-        
+        self.resize(1400, 900)
+
         # Worker thread tracking
         self.worker = None
         self.processing = False
 
         self._build_ui()
+        self._apply_dark_theme()
         self._install_logging_bridge()
-        self._load_config_into_ui()
+        self._load_config()
 
-    # ---------------------- UI construction (COMPLETELY FIXED) ----------------------
-
+    # ---------------------- UI Construction ----------------------
     def _build_ui(self) -> None:
-        root = QWidget()
-        self.setCentralWidget(root)
+        """Build the complete UI with scrollable content"""
 
-        # Overall layout: left controls, right logs
+        # Central widget that holds a scroll area
+        central = QWidget()
+        self.setCentralWidget(central)
+        outer_layout = QVBoxLayout(central)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        outer_layout.addWidget(scroll)
+
+        # Root widget inside the scroll area
+        root = QWidget()
+        scroll.setWidget(root)
+
         main_layout = QHBoxLayout(root)
         main_layout.setContentsMargins(15, 15, 15, 15)
         main_layout.setSpacing(20)
 
-        # LEFT column (controls) - fixed width
+        # LEFT: Controls (fixed-ish width)
         left_widget = QWidget()
-        left_widget.setMinimumWidth(400)
-        left_widget.setMaximumWidth(450)
-        left = QVBoxLayout(left_widget)
-        left.setSpacing(15)
+        left_widget.setMinimumWidth(430)
+        left_widget.setMaximumWidth(520)
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setSpacing(15)
         main_layout.addWidget(left_widget, 0)
 
-        # RIGHT column (logs + preview)
-        right = QVBoxLayout()
-        main_layout.addLayout(right, 1)
+        # RIGHT: Logs (expandable)
+        right_layout = QVBoxLayout()
+        main_layout.addLayout(right_layout, 1)
 
-        # ----- Files group (FIXED) -----
-        files_group = QGroupBox("📁 Input & Output")
+        # --- Files Group ---
+        files_group = QGroupBox("📁 Input  Output")
         files_layout = QFormLayout()
         files_group.setLayout(files_layout)
 
         self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("Choose a source image...")
-        self.input_edit.textChanged.connect(self._on_input_changed)  # FIXED: Auto-preview
-        btn_in = QPushButton("Browse…")
+        self.input_edit.setPlaceholderText("Select source image...")
+        self.input_edit.textChanged.connect(self._on_input_changed)
+        btn_in = QPushButton("Browse...")
         btn_in.clicked.connect(self._browse_input)
-        in_row = self._hrow(self.input_edit, btn_in)
-        files_layout.addRow("Input image:", in_row)
+        files_layout.addRow("Input image:", self._hbox(self.input_edit, btn_in))
 
         self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("Choose an output folder…")
-        btn_out = QPushButton("Browse…")
+        self.output_edit.setPlaceholderText("Select output folder...")
+        btn_out = QPushButton("Browse...")
         btn_out.clicked.connect(self._browse_output)
-        out_row = self._hrow(self.output_edit, btn_out)
-        files_layout.addRow("Output folder:", out_row)
+        files_layout.addRow("Output folder:", self._hbox(self.output_edit, btn_out))
 
-        left.addWidget(files_group)
+        left_layout.addWidget(files_group)
 
-        # ----- Image Preview (NEW) -----
+        # --- Preview Group ---
         preview_group = QGroupBox("🖼️ Preview")
         preview_layout = QVBoxLayout()
         preview_group.setLayout(preview_layout)
-        
+
         self.preview_widget = ImagePreviewWidget()
         preview_layout.addWidget(self.preview_widget)
-        
-        left.addWidget(preview_group)
 
-        # ----- Engine group (FIXED) -----
+        left_layout.addWidget(preview_group)
+
+        # --- Engine Group ---
         engine_group = QGroupBox("⚡ Upscaler Engine (Real-ESRGAN NCNN)")
         engine_layout = QFormLayout()
         engine_group.setLayout(engine_layout)
 
         self.realesrgan_edit = QLineEdit()
-        self.realesrgan_edit.setPlaceholderText(r"C:\\tools\\realesrgan-ncnn-vulkan.exe")
-        btn_rex = QPushButton("Browse…")
+        self.realesrgan_edit.setPlaceholderText(r"C:\tools\realesrgan-ncnn-vulkan.exe")
+        btn_rex = QPushButton("Browse...")
         btn_rex.clicked.connect(self._browse_realesrgan)
-        rex_row = self._hrow(self.realesrgan_edit, btn_rex)
-        engine_layout.addRow("Executable:", rex_row)
+        engine_layout.addRow("Executable:", self._hbox(self.realesrgan_edit, btn_rex))
 
         self.model_edit = QLineEdit("realesrgan-x4plus")
         engine_layout.addRow("Model:", self.model_edit)
 
-        # Advanced engine options (FIXED)
-        adv_row = QHBoxLayout()
-        adv_row.setSpacing(12)
+        # Advanced options
+        adv_layout = QHBoxLayout()
+        adv_layout.setSpacing(12)
 
         self.tilesize_spin = QSpinBox()
-        self.tilesize_spin.setRange(64, 512)  # FIXED: Capped at 512 to prevent VRAM issues
+        self.tilesize_spin.setRange(64, 512)
         self.tilesize_spin.setSingleStep(64)
         self.tilesize_spin.setValue(512)
-        self.tilesize_spin.setToolTip("Tile size is automatically capped at 512 to prevent VRAM crashes")
-        adv_row.addWidget(QLabel("Tile size:"))
-        adv_row.addWidget(self.tilesize_spin)
+        self.tilesize_spin.setToolTip("Tile size (capped at 512 to prevent VRAM crashes)")
+        adv_layout.addWidget(QLabel("Tile:"))
+        adv_layout.addWidget(self.tilesize_spin)
 
-        # FIXED: Properly styled checkbox
-        self.fp16_check = QCheckBox("Use FP16")
+        self.fp16_check = QCheckBox("FP16")
         self.fp16_check.setChecked(True)
-        self.fp16_check.setToolTip("FP16 provides faster processing but may cause issues on some GPUs")
-        adv_row.addWidget(self.fp16_check)
+        self.fp16_check.setToolTip("Use FP16 precision (faster, may fail on some GPUs)")
+        adv_layout.addWidget(self.fp16_check)
+        adv_layout.addStretch()
 
-        adv_wrap = QWidget()
-        adv_wrap.setLayout(adv_row)
-        engine_layout.addRow("Advanced:", adv_wrap)
+        engine_layout.addRow("Advanced:", self._widget_from_layout(adv_layout))
 
-        left.addWidget(engine_group)
+        left_layout.addWidget(engine_group)
 
-        # ----- Print settings group (FIXED) -----
+        # --- Print Settings Group ---
         print_group = QGroupBox("🖨️ Print Settings")
         print_layout = QFormLayout()
         print_group.setLayout(print_layout)
-
+        
         self.paper_combo = QComboBox()
-        for key in ("a1", "a2", "a3"):
-            self.paper_combo.addItem(key.upper(), key)
+        for key in ("a0", "a1", "a2", "a3", "a4"):
+            w, h = A_SIZES_MM[key]
+            self.paper_combo.addItem(f"{key.upper()} ({w}×{h} mm)", key)
         self.paper_combo.setCurrentIndex(0)
         print_layout.addRow("Paper:", self.paper_combo)
 
         self.dpi_combo = QComboBox()
         for val in [150, 200, 240, 300, 450, 600]:
             self.dpi_combo.addItem(f"{val} DPI", val)
-        # Default to 300 DPI
-        idx_300 = next(
-            (i for i in range(self.dpi_combo.count()) if self.dpi_combo.itemData(i) == 300),
-            0,
-        )
-        self.dpi_combo.setCurrentIndex(idx_300)
+        self.dpi_combo.setCurrentIndex(3)  # Default to 300 DPI
         print_layout.addRow("DPI:", self.dpi_combo)
 
-        # FIXED: Properly styled checkbox
         self.landscape_check = QCheckBox("Landscape orientation")
         print_layout.addRow("Orientation:", self.landscape_check)
 
-        # FIXED: Properly styled checkbox  
         self.force600_check = QCheckBox("Force 600 DPI (expert mode)")
-        self.force600_check.setToolTip("600 DPI creates very large files and may cause memory issues")
+        self.force600_check.setToolTip("600 DPI creates very large files")
         print_layout.addRow("High DPI:", self.force600_check)
 
-        left.addWidget(print_group)
+        left_layout.addWidget(print_group)
 
-        # ----- Controls row (FIXED) -----
-        controls_row = QHBoxLayout()
-        
+        # --- Control Buttons ---
+        controls_layout = QHBoxLayout()
+        controls_layout.setSpacing(10)
+
         self.run_btn = QPushButton("🚀 Process Image")
         self.run_btn.setMinimumHeight(40)
+        self.run_btn.setObjectName("run_btn")
         self.run_btn.clicked.connect(self._run)
-        
-        self.savecfg_btn = QPushButton("💾 Save Settings")
-        self.savecfg_btn.clicked.connect(self._save_config)
-        
-        self.cancel_btn = QPushButton("❌ Cancel")
-        self.cancel_btn.setVisible(False)  # Hidden until processing starts
-        self.cancel_btn.clicked.connect(self._cancel_processing)
-        
-        controls_row.addWidget(self.run_btn)
-        controls_row.addWidget(self.savecfg_btn)
-        controls_row.addWidget(self.cancel_btn)
-        left.addLayout(controls_row)
+        controls_layout.addWidget(self.run_btn)
 
-        # ----- Status and Progress (FIXED) -----
-        self.status_label = QLabel("Ready to process images")
+        self.save_btn = QPushButton("💾 Save Config")
+        self.save_btn.clicked.connect(self._save_config)
+        controls_layout.addWidget(self.save_btn)
+
+        self.cancel_btn = QPushButton("❌ Cancel")
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.clicked.connect(self._cancel)
+        controls_layout.addWidget(self.cancel_btn)
+
+        left_layout.addLayout(controls_layout)
+
+        # --- Status & Progress ---
+        self.status_label = QLabel("Ready")
         self.status_label.setStyleSheet("color: #888; font-style: italic;")
-        left.addWidget(self.status_label)
-        
-        # FIXED: Smooth progress bar
+        left_layout.addWidget(self.status_label)
+
         self.progress = SmoothProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.setTextVisible(True)
-        left.addWidget(self.progress)
+        left_layout.addWidget(self.progress)
 
-        # ----- RIGHT: Logs -----
+        left_layout.addStretch()
+
+        # --- RIGHT: Logs ---
         log_group = QGroupBox("📋 Processing Logs")
         log_layout = QVBoxLayout()
         log_group.setLayout(log_layout)
-        
+
         self.log_edit = QTextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.log_edit.setPlaceholderText("Processing logs will appear here...")
-        self.log_edit.setMinimumHeight(400)
+        self.log_edit.setMinimumHeight(500)
         log_layout.addWidget(self.log_edit)
-        
-        right.addWidget(log_group)
 
-        # Tooltips for clarity
-        files_group.setToolTip("Choose the input image and where to save the output file.")
-        engine_group.setToolTip("Configure the Real-ESRGAN NCNN executable and model.")
-        print_group.setToolTip("A1/A2/A3 paper and DPI for the final poster.")
+        right_layout.addWidget(log_group)
 
-        # FIXED: Apply beautiful dark theme
-        self._apply_beautiful_dark_theme()
-
-    def _apply_beautiful_dark_theme(self) -> None:
-        """FIXED: ChatGPT-inspired dark theme with proper checkbox styling"""
-        self.setStyleSheet("""
-            /* Main window and base widgets */
+    def _apply_dark_theme(self) -> None:
+        """Apply production-ready dark theme (ChatGPT-inspired)"""
+        self.setStyleSheet(
+            """
             QMainWindow {
                 background-color: #0d1117;
-                color: #e6edf3;
             }
-            
+
             QWidget {
                 background-color: #0d1117;
-                color: #e6edf3;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
-                font-size: 13px;
+                color: #c9d1d9;
+                font-family: 'Segoe UI', Arial, sans-serif;
+                font-size: 10pt;
             }
-            
-            /* Group boxes */
+
             QGroupBox {
+                background-color: #161b22;
                 border: 1px solid #30363d;
-                border-radius: 8px;
+                border-radius: 6px;
                 margin-top: 12px;
                 padding-top: 16px;
                 font-weight: 600;
-                color: #f0f6fc;
+                color: #c9d1d9;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 8px;
-                background-color: #0d1117;
-                color: #58a6ff;
+                subcontrol-position: top left;
+                left: 10px;
+                padding: 0 5px;
             }
-            
-            /* Input fields */
-            QLineEdit, QComboBox, QSpinBox {
-                background-color: #21262d;
+
+            QLineEdit {
+                background-color: #0d1117;
                 border: 1px solid #30363d;
                 border-radius: 6px;
-                padding: 8px 12px;
-                color: #e6edf3;
+                padding: 6px 10px;
+                color: #c9d1d9;
                 selection-background-color: #1f6feb;
-                min-height: 16px;
             }
-            QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
-                border-color: #1f6feb;
-                outline: none;
+            QLineEdit:focus {
+                border: 1px solid #388bfd;
             }
-            QLineEdit:hover, QComboBox:hover, QSpinBox:hover {
-                border-color: #484f58;
+            QLineEdit:disabled {
+                background-color: #161b22;
+                color: #6e7681;
             }
-            
-            /* Dropdown arrows */
+
+            QComboBox {
+                background-color: #0d1117;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                padding: 6px 10px;
+                color: #c9d1d9;
+            }
+            QComboBox:hover {
+                border: 1px solid #388bfd;
+            }
             QComboBox::drop-down {
                 border: none;
                 width: 20px;
             }
             QComboBox::down-arrow {
                 image: none;
-                border: 4px solid transparent;
-                border-top-color: #7d8590;
-                width: 0;
-                height: 0;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 6px solid #c9d1d9;
+                margin-right: 8px;
             }
-            
-            /* Buttons */
-            QPushButton {
-                background-color: #238636;
-                color: white;
-                border: 1px solid #2ea043;
-                border-radius: 6px;
-                padding: 8px 16px;
-                font-weight: 500;
-                min-height: 20px;
+            QComboBox QAbstractItemView {
+                background-color: #161b22;
+                border: 1px solid #30363d;
+                selection-background-color: #1f6feb;
+                color: #c9d1d9;
             }
-            QPushButton:hover {
-                background-color: #2ea043;
-                border-color: #46954a;
-            }
-            QPushButton:pressed {
-                background-color: #1a7f37;
-            }
-            QPushButton:disabled {
-                background-color: #21262d;
-                color: #484f58;
-                border-color: #30363d;
-            }
-            
-            /* Special button styling */
-            QPushButton[text="🚀 Process Image"] {
-                background-color: #1f6feb;
-                border-color: #1f6feb;
-                font-size: 14px;
-                font-weight: 600;
-            }
-            QPushButton[text="🚀 Process Image"]:hover {
-                background-color: #4184e4;
-            }
-            QPushButton[text="❌ Cancel"] {
-                background-color: #da3633;
-                border-color: #da3633;
-            }
-            QPushButton[text="❌ Cancel"]:hover {
-                background-color: #f85149;
-            }
-            
-            /* Progress bar */
-            QProgressBar {
-                background-color: #21262d;
+
+            QSpinBox {
+                background-color: #0d1117;
                 border: 1px solid #30363d;
                 border-radius: 6px;
-                text-align: center;
-                color: #e6edf3;
-                font-weight: 500;
-                min-height: 20px;
+                padding: 4px 8px;
+                color: #c9d1d9;
             }
-            QProgressBar::chunk {
-                background-color: #238636;
-                border-radius: 5px;
+            QSpinBox:focus {
+                border: 1px solid #388bfd;
             }
-            
-            /* CRITICAL FIX: Proper checkbox styling */
+            QSpinBox::up-button, QSpinBox::down-button {
+                background-color: #21262d;
+                border: none;
+                width: 16px;
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background-color: #30363d;
+            }
+
+            /* Checkboxes with visible check state */
             QCheckBox {
-                color: #e6edf3;
                 spacing: 8px;
-                font-size: 13px;
+                color: #c9d1d9;
             }
             QCheckBox::indicator {
-                width: 16px;
-                height: 16px;
-                border: 1px solid #484f58;
-                border-radius: 3px;
-                background-color: #21262d;
+                width: 18px;
+                height: 18px;
+                border: 2px solid #30363d;
+                border-radius: 4px;
+                background-color: #0d1117;
             }
             QCheckBox::indicator:hover {
-                border-color: #58a6ff;
-                background-color: #30363d;
+                border-color: #388bfd;
             }
             QCheckBox::indicator:checked {
                 background-color: #1f6feb;
                 border-color: #1f6feb;
-                image: url(data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='white'%3E%3Cpath d='M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z'/%3E%3C/svg%3E);
             }
-            QCheckBox::indicator:checked:hover {
-                background-color: #4184e4;
+            QCheckBox::indicator:disabled {
+                background-color: #161b22;
+                border-color: #21262d;
             }
-            
-            /* Text areas */
+
+            QPushButton {
+                background-color: #21262d;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                padding: 6px 16px;
+                color: #c9d1d9;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #30363d;
+                border-color: #8b949e;
+            }
+            QPushButton:pressed {
+                background-color: #161b22;
+            }
+            QPushButton:disabled {
+                background-color: #161b22;
+                color: #484f58;
+                border-color: #21262d;
+            }
+
+            QPushButton#run_btn {
+                background-color: #238636;
+                border-color: #2ea043;
+                color: white;
+            }
+            QPushButton#run_btn:hover {
+                background-color: #2ea043;
+            }
+            QPushButton#run_btn:pressed {
+                background-color: #1a7f37;
+            }
+            QPushButton#run_btn:disabled {
+                background-color: #161b22;
+                color: #484f58;
+                border-color: #21262d;
+            }
+
+            QProgressBar {
+                background-color: #0d1117;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                text-align: center;
+                color: #c9d1d9;
+                height: 24px;
+            }
+            QProgressBar::chunk {
+                background-color: #1f6feb;
+                border-radius: 5px;
+            }
+
             QTextEdit {
                 background-color: #0d1117;
                 border: 1px solid #30363d;
                 border-radius: 6px;
-                color: #e6edf3;
-                selection-background-color: #1f6feb;
-                padding: 12px;
-                font-family: ui-monospace, SFMono-Regular, 'SF Mono', Monaco, Inconsolata, 'Roboto Mono', monospace;
-                font-size: 12px;
-                line-height: 1.4;
+                color: #c9d1d9;
+                padding: 8px;
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 9pt;
             }
-            
-            /* Spin boxes */
-            QSpinBox::up-button, QSpinBox::down-button {
-                background-color: #30363d;
-                border: none;
-                width: 16px;
-                height: 12px;
-            }
-            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
-                background-color: #484f58;
-            }
-            QSpinBox::up-arrow {
-                image: none;
-                border: 3px solid transparent;
-                border-bottom-color: #7d8590;
-                width: 0;
-                height: 0;
-            }
-            QSpinBox::down-arrow {
-                image: none;
-                border: 3px solid transparent;
-                border-top-color: #7d8590;
-                width: 0;
-                height: 0;
-            }
-            
-            /* Labels */
+
             QLabel {
-                color: #e6edf3;
+                color: #c9d1d9;
+                background: transparent;
             }
-            
-            /* Image preview specific styling */
-            ImagePreviewWidget {
-                border: 2px dashed #30363d;
-                border-radius: 8px;
-                background-color: #161b22;
-                color: #7d8590;
+
+            QScrollBar:vertical {
+                background: #0d1117;
+                width: 12px;
+                border-radius: 6px;
             }
-        """)
+            QScrollBar::handle:vertical {
+                background: #30363d;
+                border-radius: 6px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #484f58;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar:horizontal {
+                background: #0d1117;
+                height: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #30363d;
+                border-radius: 6px;
+                min-width: 20px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #484f58;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+        """
+        )
 
     # ---------------------- Helpers ----------------------
+    def _hbox(self, *widgets: QWidget) -> QWidget:
+        """Create horizontal box layout with widgets"""
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        for w in widgets:
+            layout.addWidget(w)
+        return container
 
-    def _hrow(self, *widgets: QWidget) -> QWidget:
-        w = QWidget()
-        lay = QHBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(8)
-        for wid in widgets:
-            lay.addWidget(wid)
-        return w
+    def _widget_from_layout(self, layout: QHBoxLayout) -> QWidget:
+        """Wrap layout in widget"""
+        widget = QWidget()
+        widget.setLayout(layout)
+        return widget
 
     def _append_log(self, text: str) -> None:
-        """FIXED: Better log formatting and auto-scroll"""
-        timestamp = QTimer()
-        self.log_edit.append(f"[{timestamp.remainingTime()}] {text}")
+        """Append text to log widget"""
+        self.log_edit.append(text)
         self.log_edit.moveCursor(QTextCursor.MoveOperation.End)
-        self.log_edit.ensureCursorVisible()
 
     def _on_input_changed(self, path: str) -> None:
-        """FIXED: Auto-update preview when input changes"""
+        """Update preview when input changes"""
         self.preview_widget.setImagePath(path)
 
-    # ---------------------- Logging bridge ----------------------
-
+    # ---------------------- Logging Bridge ----------------------
     def _install_logging_bridge(self) -> None:
-        self.qt_log_emitter = QtLogEmitter()
-        self.qt_log_emitter.message.connect(self._append_log)
+        """Connect Python logging to GUI"""
+        emitter = QtLogEmitter()
+        emitter.message.connect(self._append_log)
 
-        self.qt_handler = QtLogHandler(self.qt_log_emitter)
-        fmt = logging.Formatter("%(levelname)s | %(message)s")
-        self.qt_handler.setFormatter(fmt)
+        handler = QtLogHandler(emitter)
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s | %(levelname)s | %(message)s",
+                datefmt="%H:%M:%S",
+            )
+        )
 
-        # Attach to the pipeline logger only
-        self.pipeline_logger = logging.getLogger("poster-pipeline")
-        self.pipeline_logger.setLevel(logging.INFO)
-        if not any(isinstance(h, QtLogHandler) for h in self.pipeline_logger.handlers):
-            self.pipeline_logger.addHandler(self.qt_handler)
-
-        # Do NOT propagate to root to avoid duplicate console logs
-        self.pipeline_logger.propagate = False
+        pipeline_logger = logging.getLogger("poster-pipeline")
+        pipeline_logger.addHandler(handler)
+        pipeline_logger.setLevel(logging.INFO)
 
     # ---------------------- Config ----------------------
+    def _load_config(self) -> None:
+        """Load saved configuration"""
+        if not CONFIG_PATH.exists():
+            return
 
-    def _load_config_into_ui(self) -> None:
-        if CONFIG_PATH.exists():
-            try:
-                data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-        else:
-            data = {}
+        try:
+            with open(CONFIG_PATH, "r") as f:
+                cfg = json.load(f)
 
-        self.realesrgan_edit.setText(
-            data.get("realesrgan_exe", r"C:\\tools\\realesrgan-ncnn-vulkan.exe")
-        )
+            self.input_edit.setText(cfg.get("input_path", ""))
+            self.output_edit.setText(cfg.get("output_dir", ""))
+            self.realesrgan_edit.setText(cfg.get("realesrgan_exe", ""))
+            self.model_edit.setText(cfg.get("model", "realesrgan-x4plus"))
 
-        if "last_input" in data:
-            self.input_edit.setText(data["last_input"])
-        if "last_output" in data:
-            self.output_edit.setText(data["last_output"])
+            paper_idx = self.paper_combo.findData(cfg.get("paper", "a1"))
+            if paper_idx >= 0:
+                self.paper_combo.setCurrentIndex(paper_idx)
 
-        paper = data.get("paper", "a1")
-        idx_paper = max(0, self.paper_combo.findData(paper))
-        self.paper_combo.setCurrentIndex(idx_paper)
+            dpi_idx = self.dpi_combo.findData(cfg.get("dpi", 300))
+            if dpi_idx >= 0:
+                self.dpi_combo.setCurrentIndex(dpi_idx)
 
-        dpi_val = data.get("dpi", 300)
-        idx_dpi = next(
-            (i for i in range(self.dpi_combo.count()) if self.dpi_combo.itemData(i) == dpi_val),
-            self.dpi_combo.currentIndex(),
-        )
-        self.dpi_combo.setCurrentIndex(idx_dpi)
+            self.landscape_check.setChecked(cfg.get("landscape", False))
+            self.tilesize_spin.setValue(cfg.get("tilesize", 512))
+            self.fp16_check.setChecked(cfg.get("fp16", True))
+            self.force600_check.setChecked(cfg.get("force_600dpi", False))
 
-        self.landscape_check.setChecked(bool(data.get("landscape", False)))
-        self.force600_check.setChecked(bool(data.get("force_600dpi", False)))
-        self.tilesize_spin.setValue(int(data.get("tilesize", 512)))
-        self.fp16_check.setChecked(bool(data.get("fp16", True)))
-        self.model_edit.setText(data.get("model", "realesrgan-x4plus"))
+            self._append_log("✓ Configuration loaded")
+
+        except Exception as e:
+            self._append_log(f"⚠ Could not load config: {e}")
 
     def _save_config(self) -> None:
-        data = {
-            "realesrgan_exe": self.realesrgan_edit.text().strip(),
-            "last_input": self.input_edit.text().strip(),
-            "last_output": self.output_edit.text().strip(),
-            "paper": self.paper_combo.currentData(),
-            "dpi": self.dpi_combo.currentData(),
-            "landscape": self.landscape_check.isChecked(),
-            "force_600dpi": self.force600_check.isChecked(),
-            "tilesize": self.tilesize_spin.value(),
-            "fp16": self.fp16_check.isChecked(),
-            "model": self.model_edit.text().strip() or "realesrgan-x4plus",
-        }
+        """Save current configuration"""
         try:
-            CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            QMessageBox.information(self, "✅ Saved", f"Settings saved to {CONFIG_PATH}")
+            cfg = {
+                "input_path": self.input_edit.text(),
+                "output_dir": self.output_edit.text(),
+                "realesrgan_exe": self.realesrgan_edit.text(),
+                "model": self.model_edit.text(),
+                "paper": self.paper_combo.currentData(),
+                "dpi": self.dpi_combo.currentData(),
+                "landscape": self.landscape_check.isChecked(),
+                "tilesize": self.tilesize_spin.value(),
+                "fp16": self.fp16_check.isChecked(),
+                "force_600dpi": self.force600_check.isChecked(),
+            }
+
+            with open(CONFIG_PATH, "w") as f:
+                json.dump(cfg, f, indent=2)
+
+            QMessageBox.information(
+                self,
+                "✓ Configuration Saved",
+                f"Settings saved to:\n{CONFIG_PATH}",
+            )
+
         except Exception as e:
-            QMessageBox.critical(self, "❌ Save Failed", f"Could not save settings:\\n{e}")
+            QMessageBox.warning(
+                self,
+                "⚠ Save Failed",
+                f"Could not save configuration:\n{e}",
+            )
 
     # ---------------------- Browsers ----------------------
-
     def _browse_input(self) -> None:
+        """Browse for input image"""
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Choose Input Image",
-            str(Path.home()),
-            "Images (*.png *.jpg *.jpeg *.tif *.tiff *.webp *.bmp);;All Files (*)",
+            "Select Input Image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;All Files (*.*)",
         )
         if path:
             self.input_edit.setText(path)
 
     def _browse_output(self) -> None:
-        path = QFileDialog.getExistingDirectory(
-            self, "Choose Output Folder", str(Path.home())
-        )
+        """Browse for output directory"""
+        path = QFileDialog.getExistingDirectory(self, "Select Output Folder")
         if path:
             self.output_edit.setText(path)
 
     def _browse_realesrgan(self) -> None:
+        """Browse for Real-ESRGAN executable"""
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Locate realesrgan-ncnn-vulkan.exe",
-            r"C:\\tools",
-            "Executable (*.exe);;All Files (*)",
+            "Select Real-ESRGAN Executable",
+            "",
+            "Executable (*.exe);;All Files (*.*)",
         )
         if path:
             self.realesrgan_edit.setText(path)
 
-    # ---------------------- Validation & Run (COMPLETELY FIXED) ----------------------
-
+    # ---------------------- Validation & Run ----------------------
     def _validate_inputs(self) -> dict:
-        inp = self.input_edit.text().strip()
-        outd = self.output_edit.text().strip()
-        rex = self.realesrgan_edit.text().strip()
+        """Validate inputs and return arguments dict"""
+        input_path = self.input_edit.text().strip()
+        if not input_path:
+            raise ValueError("Please select an input image")
+        if not Path(input_path).exists():
+            raise FileNotFoundError(f"Input file not found:\n{input_path}")
 
-        if not inp or not Path(inp).exists():
-            raise ValueError("Please choose a valid input image.")
-        if not outd:
-            raise ValueError("Please choose an output folder.")
-        Path(outd).mkdir(parents=True, exist_ok=True)
+        output_dir = self.output_edit.text().strip()
+        if not output_dir:
+            raise ValueError("Please select an output folder")
 
-        if not rex or not Path(rex).exists():
-            raise ValueError("Please set a valid path to realesrgan-ncnn-vulkan.exe.")
+        exe_path = self.realesrgan_edit.text().strip()
+        if not exe_path:
+            raise ValueError("Please specify the Real-ESRGAN executable path")
+        if not Path(exe_path).exists():
+            raise FileNotFoundError(f"Executable not found:\n{exe_path}")
 
-        dpi = int(self.dpi_combo.currentData())
-        if dpi == 600 and not self.force600_check.isChecked():
-            raise ValueError(
-                "600 DPI requires 'Force 600 DPI (expert mode)'. "
-                "Either lower DPI or enable the checkbox."
-            )
-
-        args = {
-            "input_path": inp,
-            "output_dir": outd,
-            "paper": self.paper_combo.currentData(),  # 'a1' | 'a2' | 'a3'
-            "dpi": dpi,
+        return {
+            "input_path": input_path,
+            "output_dir": output_dir,
+            "paper": self.paper_combo.currentData(),
+            "dpi": self.dpi_combo.currentData(),
             "portrait": not self.landscape_check.isChecked(),
-            "exe_path": rex,
+            "exe_path": exe_path,
             "model": self.model_edit.text().strip() or "realesrgan-x4plus",
-            "tilesize": int(self.tilesize_spin.value()),
-            "fp16": bool(self.fp16_check.isChecked()),
-            "force_600dpi": bool(self.force600_check.isChecked()),
-            "keep_native_if_larger": False,
+            "tilesize": self.tilesize_spin.value(),
+            "fp16": self.fp16_check.isChecked(),
+            "force_600dpi": self.force600_check.isChecked(),
         }
-        return args
 
     def _run(self) -> None:
-        """FIXED: Proper thread management with UI state control"""
-        if self.processing:
-            return  # Prevent double-click
-            
+        """Start processing"""
         try:
             args = self._validate_inputs()
+
+            self.worker = ProcessWorker(args, self)
+            self.worker.progress.connect(self._on_progress)
+            self.worker.status.connect(self._on_status)
+            self.worker.preview.connect(self._on_preview)
+            self.worker.finished.connect(self._on_finished)
+
+            self._set_processing_state(True)
+
+            self.log_edit.clear()
+            self._append_log("=" * 70)
+            self._append_log("Starting AI upscaling process...")
+            self._append_log("=" * 70)
+
+            self.progress.setValue(0)
+
+            self.worker.start()
+
         except Exception as e:
-            QMessageBox.warning(self, "⚠️ Fix Settings", str(e))
-            return
+            QMessageBox.critical(
+                self,
+                "❌ Validation Error",
+                f"Cannot start processing:\n\n{str(e)}",
+            )
 
-        # Save settings before processing
-        self._save_config()
-
-        # FIXED: Set busy UI state
-        self._set_processing_state(True)
-
-        self._append_log("\\n" + "="*50)
-        self._append_log("🚀 Starting AI upscaling process...")
-        self._append_log(f"📊 Settings: {args['paper'].upper()} paper, {args['dpi']} DPI")
-        self._append_log(f"🔧 Model: {args['model']}, Tile: {args['tilesize']}, FP16: {args['fp16']}")
-        self._append_log("="*50)
-
-        # FIXED: Create and start worker thread
-        self.worker = ProcessWorker(args)
-        self.worker.progress.connect(self.progress.setValueSmooth)  # FIXED: Smooth progress
-        self.worker.preview.connect(self._on_preview)
-        self.worker.status.connect(self._on_status)  # FIXED: Status updates
-        self.worker.finished.connect(self._on_finished)
-        self.worker.start()
-
-    def _cancel_processing(self) -> None:
-        """FIXED: Graceful cancellation"""
+    def _cancel(self) -> None:
+        """Cancel processing"""
         if self.worker and self.worker.isRunning():
-            self.status_label.setText("Cancelling processing...")
-            self.worker.stop()
-            self.worker.wait(5000)  # Wait up to 5 seconds
-            if self.worker.isRunning():
-                self.worker.terminate()
-                self.worker.wait()
-                
-        self._set_processing_state(False)
-        self.progress.setValue(0)
-        self.status_label.setText("Processing cancelled")
-        self._append_log("❌ Processing cancelled by user")
+            reply = QMessageBox.question(
+                self,
+                "Cancel Processing?",
+                "Are you sure you want to cancel the current operation?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+
+            if reply == QMessageBox.StandardButton.Yes:
+                self.worker.stop()
+                self._append_log("\n⚠ Cancellation requested...")
 
     def _set_processing_state(self, processing: bool) -> None:
-        """FIXED: Centralized UI state management"""
+        """Update UI based on processing state"""
         self.processing = processing
-        
-        # Toggle button states
+
         self.run_btn.setEnabled(not processing)
-        self.savecfg_btn.setEnabled(not processing)
-        self.cancel_btn.setVisible(processing)
-        
-        # Disable inputs during processing  
         self.input_edit.setEnabled(not processing)
         self.output_edit.setEnabled(not processing)
         self.realesrgan_edit.setEnabled(not processing)
-        
-        if processing:
-            self.status_label.setText("Processing...")
-            self.progress.setValue(0)
-        else:
-            self.status_label.setText("Ready")
+        self.model_edit.setEnabled(not processing)
+        self.paper_combo.setEnabled(not processing)
+        self.dpi_combo.setEnabled(not processing)
+        self.landscape_check.setEnabled(not processing)
+        self.tilesize_spin.setEnabled(not processing)
+        self.fp16_check.setEnabled(not processing)
+        self.force600_check.setEnabled(not processing)
+        self.save_btn.setEnabled(not processing)
+
+        self.cancel_btn.setVisible(processing)
+
+    def _on_progress(self, pct: int) -> None:
+        """Handle progress update"""
+        self.progress.setValueSmooth(pct)
 
     def _on_status(self, message: str) -> None:
-        """FIXED: Handle status updates from worker"""
+        """Handle status update"""
         self.status_label.setText(message)
 
     def _on_preview(self, path: str) -> None:
-        """FIXED: Handle preview updates from worker thread"""
-        try:
-            self._append_log(f"🖼️ Preview updated: {Path(path).name}")
-            # Could update preview widget here if desired
-        except Exception as e:
-            self._append_log(f"Preview update failed: {e}")
+        """Handle preview update"""
+        self.preview_widget.setImagePath(path)
 
     def _on_finished(self, success: bool, out_path: str, error: str) -> None:
-        """FIXED: Handle completion with proper error handling and folder opening"""
+        """Handle processing completion"""
         self._set_processing_state(False)
-        
+
         if success:
             self.progress.setValueSmooth(100)
             self.status_label.setText("✅ Processing completed!")
-            self._append_log(f"✅ SUCCESS! Output saved to:")
+            self._append_log("\n✅ SUCCESS! Output saved to:")
             self._append_log(f"📁 {out_path}")
-            
-            # FIXED: Show success dialog with option to open folder
+
             reply = QMessageBox.question(
-                self, 
-                "🎉 Processing Complete!", 
-                f"Image successfully processed!\\n\\n📁 {out_path}\\n\\nOpen output folder?",
+                self,
+                "🎉 Processing Complete!",
+                f"Image successfully processed!\n\n📁 {out_path}\n\nOpen output folder?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes
+                QMessageBox.StandardButton.Yes,
             )
-            
+
             if reply == QMessageBox.StandardButton.Yes:
                 self._open_output_folder(out_path)
-                
+
         else:
             self.progress.setValue(0)
             self.status_label.setText("❌ Processing failed")
-            self._append_log("❌ FAILED!")
-            self._append_log(f"Error: {error}")
-            
-            # FIXED: Show detailed error in modal dialog
+            self._append_log("\n❌ FAILED!")
+
             error_dialog = QMessageBox(self)
             error_dialog.setIcon(QMessageBox.Icon.Critical)
             error_dialog.setWindowTitle("❌ Processing Failed")
@@ -882,33 +943,36 @@ class MainWindow(QMainWindow):
             error_dialog.exec()
 
     def _open_output_folder(self, file_path: str) -> None:
-        """FIXED: Reliably open output folder on Windows"""
+        """Reliably open output folder on all OSes"""
         try:
             folder_path = Path(file_path).parent
             if sys.platform == "win32":
-                # Use Windows explorer with file selection
                 subprocess.run(["explorer", "/select,", str(file_path)], check=False)
-            elif sys.platform == "darwin":  # macOS
+            elif sys.platform == "darwin":
                 subprocess.run(["open", "-R", str(file_path)], check=False)
-            else:  # Linux
+            else:
                 subprocess.run(["xdg-open", str(folder_path)], check=False)
         except Exception as e:
-            QMessageBox.warning(self, "Folder Open Failed", f"Could not open folder:\\n{e}")
+            QMessageBox.warning(
+                self,
+                "Folder Open Failed",
+                f"Could not open folder:\n{e}",
+            )
 
 
 # --------------------------- App entry ---------------------------
 
+
 def main() -> int:
     app = QApplication(sys.argv)
-    
-    # Set application properties
+
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion("2.0")
     app.setOrganizationName("PosterMaker")
-    
+
     win = MainWindow()
     win.show()
-    
+
     return app.exec()
 
 

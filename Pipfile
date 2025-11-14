@@ -4,12 +4,15 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-pillow = "*"
-pyside6 = "*"
 pytest = "*"
+pyside6 = "*"
+pillow = "*"
 
 [dev-packages]
 pytest = "*"
+nuitka = "*"
+ordered-set = "*"
+zstandard = "*"
 
 [requires]
 python_version = "3.10"
