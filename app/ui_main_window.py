@@ -64,7 +64,7 @@ class QtLogHandler(logging.Handler):
 class ProcessWorker(QThread):
     finished = Signal(bool, str, str)  # success, output_path, error_message
     progress = Signal(int)
-    preview = Signal(str)  # not used for now, but kept for compatibility
+    preview = Signal(str)  # preview path emitted from pipeline
 
     def __init__(self, args: dict, parent=None):
         super().__init__(parent)
@@ -285,6 +285,20 @@ class MainWindow(QMainWindow):
             QProgressBar::chunk {
                 background-color: #00c853;
             }
+            QCheckBox {
+                spacing: 6px;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border: 1px solid #555;
+                border-radius: 3px;
+                background: #1e1e1e;
+            }
+            QCheckBox::indicator:checked {
+                background: #2979ff;
+                border: 1px solid #2979ff;
+            }
             """
         )
 
@@ -471,8 +485,16 @@ class MainWindow(QMainWindow):
 
         self.worker = ProcessWorker(args)
         self.worker.progress.connect(self.progress.setValue)
+        self.worker.preview.connect(self._on_preview)
         self.worker.finished.connect(self._on_finished)
         self.worker.start()
+
+    def _on_preview(self, path: str) -> None:
+        # Preview callback from worker thread — invoked on main thread via signal
+        try:
+            self._append_log(f"Preview available: {path}")
+        except Exception:
+            pass
 
     def _on_finished(self, success: bool, out_path: str, error: str) -> None:
         self.run_btn.setEnabled(True)

@@ -31,7 +31,26 @@ class UpscaleWorker(QThread):
             try:
                 self.file_started.emit(str(f))
                 out_path = self._output_namer(f, self._settings)
-                process_and_save(f, out_path, self._settings)
+                # Wire progress and preview callbacks into signals
+                def _progress(p: int, fname=str(f)):
+                    try:
+                        self.file_progress.emit(str(fname), int(p))
+                    except Exception:
+                        pass
+
+                def _preview(p: str):
+                    try:
+                        self.log_line.emit(f"Preview: {p}")
+                    except Exception:
+                        pass
+
+                process_and_save(
+                    f,
+                    out_path,
+                    self._settings,
+                    progress_cb=_progress,
+                    preview_cb=_preview,
+                )
                 self.file_progress.emit(str(f), int(idx * 100 / total))
                 self.file_done.emit(str(out_path))
             except Exception as e:

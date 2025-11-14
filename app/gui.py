@@ -1,4 +1,5 @@
 # # app/gui.py
+from __future__ import annotations
 
 import sys
 from PySide6.QtWidgets import QApplication
@@ -17,7 +18,7 @@ if __name__ == "__main__":
 # app/gui.py
 # Thin wrapper so you can still do: python -m app.gui
 
-from __future__ import annotations
+
 import sys
 from PySide6.QtWidgets import QApplication
 from app.ui_main_window import MainWindow
