@@ -124,7 +124,6 @@ def _ai_pass(
     _emit_preview(preview_cb, out)
     _emit_progress(progress_cb, base_pct + step_pct)
 
-    return out
 
 def process_exact(
     input_path: str | Path,
